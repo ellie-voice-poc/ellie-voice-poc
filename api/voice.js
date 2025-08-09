@@ -1,28 +1,58 @@
-export default function handler(req, res) {
-  // Build an absolute action URL so Twilio always posts to the right place
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host = req.headers.host;
-  const base = `${proto}://${host}`;
-  const startMs = Date.now();
-  const actionUrl = `${base}/api/reply?start=${startMs}`;
+// api/tts.js — ElevenLabs TTS, with fallback to OpenAI if needed
+export const config = { api: { bodyParser: false } };
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">Hi there, it’s Ellie. I’m right here with you. How are you feeling today</Say>
+export default async function handler(req, res) {
+  const url = new URL(req.url, `https://${req.headers.host}`);
+  const text = url.searchParams.get("t") || "Hello there";
 
-  <Gather input="speech"
-          language="en-US"
-          action="${actionUrl}"
-          method="POST"
-          speechTimeout="5"
-          actionOnEmptyResult="true">
-    <Say voice="alice">Go ahead and tell me anything on your mind. I’m listening.</Say>
-  </Gather>
+  // Prefer ElevenLabs if configured
+  const elKey = process.env.ELEVENLABS_API_KEY;
+  const elVoice = process.env.ELEVENLABS_VOICE_ID;
 
-  <Say voice="alice">I didn’t quite catch that. Let’s try again soon.</Say>
-  <Hangup/>
-</Response>`;
+  if (elKey && elVoice) {
+    try {
+      const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elVoice}`, {
+        method: "POST",
+        headers: {
+          "xi-api-key": elKey,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text: `Please speak like an elderly woman with a gentle Southern drawl. ${text}`,
+          model_id: "eleven_monolingual_v1",
+          voice_settings: { stability: 0.6, similarity_boost: 0.7, style: 0.4, use_speaker_boost: true }
+        })
+      });
+      if (r.ok) {
+        const buf = Buffer.from(await r.arrayBuffer());
+        res.setHeader("Content-Type", "audio/mpeg");
+        res.setHeader("Cache-Control", "no-store");
+        res.status(200).send(buf);
+        return;
+      }
+    } catch {}
+  }
 
-  res.setHeader("Content-Type", "application/xml");
-  res.status(200).send(twiml);
+  // Fallback to OpenAI TTS
+  try {
+    const r = await fetch("https://api.openai.com/v1/audio/speech", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini-tts",
+        voice: "alloy",
+        input: `In the voice of an elderly woman with a light Southern drawl, read this naturally: ${text}`,
+        format: "mp3"
+      })
+    });
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).send(buf);
+  } catch {
+    res.status(502).end();
+  }
 }
