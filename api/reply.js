@@ -1,53 +1,54 @@
 export const config = { api: { bodyParser: false } };
 
 export default async function handler(req, res) {
-  // Grab Twilio’s POST body
+  // read Twilio POST body
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString("utf8");
   const body = new URLSearchParams(raw);
 
-  // What Mom said
-  const userText = (body.get("SpeechResult") || "").trim();
+  const said = (body.get("SpeechResult") || "").trim();
 
-  // Timer and limits
+  // timer
   const url = new URL(req.url, `https://${req.headers.host}`);
-  const callStart = Number(url.searchParams.get("start") || Date.now());
-  const maxMinutes = Number(process.env.CALL_MAX_MINUTES || 10);
-  const msLeft = maxMinutes * 60000 - (Date.now() - callStart);
+  const start = Number(url.searchParams.get("start") || Date.now());
+  const maxMin = Number(process.env.CALL_MAX_MINUTES || 10);
+  const msLeft = maxMin * 60000 - (Date.now() - start);
 
-  const goodbye =
-    "Uh-uh, sounds like someone's at my door. I think I need to end this call, my friend, but I'll talk with you soon. This chat has been lovely. I sure appreciate you!";
+  const goodbye = "Uh-uh, sounds like someone's at my door. I think I need to end this call, my friend, but I'll talk with you soon. This chat has been lovely. I sure appreciate you!";
 
-  // Out of time
   if (msLeft <= 0) {
+    const byeUrl = `${url.origin}/api/tts?t=${encodeURIComponent(goodbye)}`;
     res.setHeader("Content-Type", "application/xml");
-    res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">${goodbye}</Say><Hangup/></Response>`);
+    res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${byeUrl}</Play>
+  <Hangup/>
+</Response>`);
     return;
   }
 
-  // If no speech heard, prompt again fast
-  if (!userText) {
-    const next = `${url.origin}/api/reply?start=${callStart}`;
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  // if nothing heard, prompt again with TTS and keep gathering
+  if (!said) {
+    const next = `${url.origin}/api/reply?start=${start}`;
+    const promptUrl = `${url.origin}/api/tts?t=${encodeURIComponent("I’m listening. Tell me what’s on your mind.")}`;
+    res.setHeader("Content-Type", "application/xml");
+    res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">I’m listening.</Say>
+  <Play>${promptUrl}</Play>
   <Gather input="speech" language="en-US" action="${next}" method="POST" speechTimeout="5" actionOnEmptyResult="true">
-    <Say voice="alice">Tell me what’s on your mind.</Say>
+    <Play>${promptUrl}</Play>
   </Gather>
   <Redirect method="POST">${next}</Redirect>
-</Response>`;
-    res.setHeader("Content-Type", "application/xml");
-    res.status(200).send(twiml);
+</Response>`);
     return;
   }
 
-  // Ask OpenAI for Ellie’s short, warm reply
-  let ellie = "I’m here, sugar. Tell me a little more about that.";
+  // ask OpenAI for Ellie’s reply
+  let ellie = "";
   try {
-    const systemStyle =
-      "You are Ellie, a kind, elderly woman with a gentle Southern drawl. You speak slowly and warmly, use simple language, and keep replies to 1–3 sentences with an occasional gentle follow-up. Avoid medical or legal advice.";
-    const prompt = `Caller said: "${userText}". Reply as Ellie with warmth and a light Southern drawl. Keep it short and supportive; ask a simple follow-up only if it helps.`;
+    const systemStyle = "You are Ellie, a kind, elderly woman with a gentle Southern drawl. Speak slowly, warmly, and simply. Keep replies 1–3 sentences. Avoid medical or legal advice.";
+    const prompt = `Caller said: "${said}". Reply as Ellie with warmth and a light Southern drawl. Keep it short and supportive; ask a simple follow-up only if helpful.`;
 
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -61,33 +62,32 @@ export default async function handler(req, res) {
           { role: "system", content: systemStyle },
           { role: "user", content: prompt }
         ],
-        temperature: 0.7,
+        temperature: 0.6,
         max_tokens: 120
       })
     });
 
+    if (!r.ok) throw new Error(`OpenAI ${r.status} ${r.statusText}`);
     const data = await r.json();
-    ellie = (data?.choices?.[0]?.message?.content || "").trim() || ellie;
-  } catch (e) {
-    // Fallback if OpenAI hiccups
-    ellie = "I’m right here. How are you feeling about that, sweetheart";
+    ellie = (data?.choices?.[0]?.message?.content || "").trim() || "I’m right here with you, sweetheart.";
+  } catch {
+    ellie = "I’m right here with you, sweetheart. Could you tell me a little more about that";
   }
 
-  // If under 20 seconds left, land the plane
   const almostOut = msLeft < 20000;
-  const next = `${url.origin}/api/reply?start=${callStart}`;
+  const next = `${url.origin}/api/reply?start=${start}`;
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">${almostOut ? goodbye : ellie}</Say>
-  ${almostOut ? "<Hangup/>" : `
-  <Gather input="speech" language="en-US" action="${next}" method="POST" speechTimeout="5" actionOnEmptyResult="true">
-    <Say voice="alice">I’m listening.</Say>
-  </Gather>
-  <Say voice="alice">I didn’t catch that. Let’s try again.</Say>
-  <Redirect method="POST">${next}</Redirect>`}
-</Response>`;
+  const speakUrl = `${url.origin}/api/tts?t=${encodeURIComponent(almostOut ? goodbye : ellie)}`;
+  const promptUrl = `${url.origin}/api/tts?t=${encodeURIComponent("I’m listening.")}`;
 
   res.setHeader("Content-Type", "application/xml");
-  res.status(200).send(twiml);
+  res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${speakUrl}</Play>
+  ${almostOut ? "<Hangup/>" : `
+  <Gather input="speech" language="en-US" action="${next}" method="POST" speechTimeout="5" actionOnEmptyResult="true">
+    <Play>${promptUrl}</Play>
+  </Gather>
+  <Redirect method="POST">${next}</Redirect>`}
+</Response>`);
 }
