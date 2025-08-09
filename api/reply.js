@@ -1,13 +1,18 @@
-// Turn-by-turn loop: Mom speaks → Ellie replies → repeat until time limit
-export default async function handler(req, res) {
-  // 1) Parse Twilio's form POST safely
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  const body = new URLSearchParams(raw);
+// reply.js
+export const config = {
+  api: {
+    bodyParser: false // We handle raw POST body ourselves
+  }
+};
 
-  // 2) Pull what Twilio heard
-  const userText = (body.get("SpeechResult") || "").trim();
+export default async function handler(req, res) {
+  // Collect raw POST data from Twilio
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks).toString();
+  const body = new URLSearchParams(rawBody);
+
+  const userText = body.get("SpeechResult") || "";
   const start = new URL(req.url, `https://${req.headers.host}`).searchParams.get("start");
   const callStart = Number(start || Date.now());
   const maxMinutes = Number(process.env.CALL_MAX_MINUTES || 10);
@@ -16,32 +21,20 @@ export default async function handler(req, res) {
   const goodbye =
     "Uh-uh, sounds like someone's at my door. I think I need to end this call, my friend, but I'll talk with you soon. This chat has been lovely. I sure appreciate you!";
 
-  // 3) Time up? Say goodbye and hang up
+  // If time is up
   if (msLeft <= 0) {
     res.setHeader("Content-Type", "application/xml");
-    res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">${goodbye}</Say><Hangup/></Response>`);
+    res.status(200).send(
+      `<?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Say voice="alice">${goodbye}</Say>
+        <Hangup/>
+      </Response>`
+    );
     return;
   }
 
-  // 4) If Twilio heard nothing, prompt again quickly
-  if (!userText) {
-    const proto = req.headers["x-forwarded-proto"] || "https";
-    const host = req.headers.host;
-    const nextAction = `${proto}://${host}/api/reply?start=${callStart}`;
-    const twimlNoInput = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">I’m listening.</Say>
-  <Gather input="speech" language="en-US" action="${nextAction}" method="POST" speechTimeout="5" actionOnEmptyResult="true">
-    <Say voice="alice">Tell me what’s on your mind.</Say>
-  </Gather>
-  <Redirect method="POST">${nextAction}</Redirect>
-</Response>`;
-    res.setHeader("Content-Type", "application/xml");
-    res.status(200).send(twimlNoInput);
-    return;
-  }
-
-  // 5) Ask OpenAI for Ellie’s short, warm reply
+  // Ask OpenAI for Ellie’s reply
   let ellie = "I’m here, sugar. Tell me a little more about that.";
   try {
     const prompt = `Caller said: "${userText}". Reply as Ellie, an elderly woman with a gentle Southern drawl. Be warm, 1–3 sentences, simple words, and you may ask a short follow-up.`;
@@ -54,7 +47,11 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: "You are Ellie, a kind, elderly woman with a gentle Southern drawl. Speak slowly, warmly, and simply. Avoid medical or legal advice." },
+          {
+            role: "system",
+            content:
+              "You are Ellie, a kind, elderly woman with a gentle Southern drawl. Speak slowly, warmly, and simply. Avoid medical or legal advice."
+          },
           { role: "user", content: prompt }
         ],
         temperature: 0.7,
@@ -62,10 +59,12 @@ export default async function handler(req, res) {
       })
     });
     const data = await r.json();
-    ellie = (data?.choices?.[0]?.message?.content || "").trim() || ellie;
-  } catch {}
+    ellie = data?.choices?.[0]?.message?.content?.trim() || ellie;
+  } catch (err) {
+    console.error("OpenAI error", err);
+  }
 
-  // 6) If under 20s remain, land the plane
+  // If under 20s remain
   const almostOut = msLeft < 20000;
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host = req.headers.host;
@@ -74,12 +73,16 @@ export default async function handler(req, res) {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">${almostOut ? goodbye : ellie}</Say>
-  ${almostOut ? "<Hangup/>" : `
-  <Gather input="speech" language="en-US" action="${nextAction}" method="POST" speechTimeout="5" actionOnEmptyResult="true">
+  ${
+    almostOut
+      ? "<Hangup/>"
+      : `
+  <Gather input="speech" action="${nextAction}" method="POST" speechTimeout="auto" language="en-US" actionOnEmptyResult="true">
     <Say voice="alice">I’m listening.</Say>
   </Gather>
   <Say voice="alice">I didn’t catch that. Let’s try again.</Say>
-  <Redirect method="POST">${nextAction}</Redirect>`}
+  <Redirect method="POST">${nextAction}</Redirect>`
+  }
 </Response>`;
 
   res.setHeader("Content-Type", "application/xml");
